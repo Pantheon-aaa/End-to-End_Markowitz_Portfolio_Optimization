@@ -109,13 +109,6 @@ E2E consistently outperforms the two-stage approach across all settings, with:
 - Lower portfolio turnover (20–27% reduction)
 - Shallower maximum drawdowns
 
-## Tech Stack
-
-- **Python 3.x** / **PyTorch** — model training and autograd
-- **NumPy** / **SciPy** (`brentq`) — optimization layer forward solve
-- **Pandas** — data processing
-- **Matplotlib** — visualization
-
 ## Reference
 
 Wang, Y., Gao, H., Harvey, C. R., Liu, Y., & Tao, X. (2026). *Machine Learning Meets Markowitz*. SSRN.
