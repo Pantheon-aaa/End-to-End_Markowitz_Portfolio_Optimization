@@ -1,0 +1,1093 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{threeparttable}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{multirow}
+\usepackage{natbib}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstdefinestyle{appendixpython}{
+    language=Python,
+    basicstyle=\ttfamily\scriptsize,
+    numbers=left,
+    numberstyle=\tiny,
+    stepnumber=1,
+    numbersep=6pt,
+    showstringspaces=false,
+    breaklines=true,
+    breakatwhitespace=false,
+    columns=fullflexible,
+    keepspaces=true,
+    frame=single,
+    framerule=0.3pt,
+    tabsize=4,
+    captionpos=b,
+    commentstyle=\color{gray!70!black}\itshape,
+    keywordstyle=\color{blue!60!black}\bfseries,
+    stringstyle=\color{orange!70!black}
+}
+
+\title{\textbf{End-to-End Markowitz Portfolio Optimization:\\
+A Methodological Replication Using CSI 300 Stocks}}
+\author{
+Cong Wang \quad Zirui Chen\quad Chenxu Du \quad Wentao Yang\\
+Jingzhi Li \quad Yixuan Wang \quad Qiyuan Zheng
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project provides a methodology-oriented replication of \citet{wang2026mlmm}, using monthly CSI 300 constituent-level factor and return data rather than the full daily China A-share universe used in the original paper. The central research question is whether the standard two-stage ``predict-then-optimize'' paradigm, in which a machine learning model is first trained by mean squared error (MSE) and then passed into a Markowitz optimizer, is misaligned with the investor's final portfolio objective. Following the end-to-end (E2E) logic in \citet{wang2026mlmm}, we embed a differentiable portfolio optimization layer into model training and train the prediction model using realized portfolio utility. Our implementation proceeds in three warm-start objective specifications: a return-only E2E model, a mean--standard-deviation E2E model with risk aversion, and an Eq.~(21)-aligned E2E model with return, risk, and transaction costs. Across the main out-of-sample period from 2023-04 to 2025-09, E2E consistently outperforms the MSE-Opt benchmark. In the return-plus-risk-plus-transaction-cost specification with $\lambda=1.0$ and $\gamma=0.003$, E2E improves annualized return from 18.03\% to 29.32\%, raises the Sharpe ratio from 0.769 to 1.215, and reduces average two-sided turnover from 132.71\% to 112.03\%. We further conduct a risk-aversion sensitivity analysis over six values of $\lambda\in\{0.1,0.5,1.0,2.0,5.0,10.0\}$ under $\gamma\in\{0.001,0.002,0.003\}$; the results trace a clear E2E efficient-frontier pattern in which lower $\lambda$ delivers higher raw return, while intermediate $\lambda$ values deliver the strongest Sharpe ratios and larger $\lambda$ values reduce volatility, drawdown, and turnover. These results support the paper's main insight: better return forecasts in the statistical sense are not necessarily better portfolio inputs; the relevant object is the forecast induced by the investor's constraints, risk preference, and implementation frictions.
+\end{abstract}
+
+\section{Introduction}
+
+The classical Markowitz framework assumes that the vector of expected returns and the covariance matrix are already known. Once these two inputs are available, portfolio construction is a well-defined optimization problem. In practice, however, the expected return vector is not observed and must be estimated. The conventional machine-learning workflow therefore separates the problem into two stages: first estimate expected returns by minimizing a statistical loss such as MSE; then plug these estimates into a portfolio optimizer. This two-stage architecture is simple, but it implicitly treats all cross-sectional prediction errors as equally important.
+
+The key argument of \citet{wang2026mlmm} is that this statistical objective is not the same as the economic objective. A portfolio manager does not ultimately care about minimizing average forecast error across all stocks. The manager cares about the realized utility of the portfolio formed from these forecasts. When the final portfolio is long-only, capped by concentration constraints, exposed to risk aversion, and subject to transaction costs, forecast precision is most valuable for the stocks that are likely to enter the portfolio or affect the active constraints. Hence, the optimal forecasting model should depend on the investor's downstream decision problem.
+
+Our project is a small-scale methodological replication of this idea. Instead of reproducing the entire empirical design of \citet{wang2026mlmm}, we apply the paper's E2E logic to a CSI 300 monthly setting. The raw data span 2020-04 to 2025-12; after constructing forward returns, the effective sample contains 68 monthly cross-sections from 2020-04 to 2025-09. We construct 103 candidate factors, screen them through monthly Spearman information coefficient (IC) tests and coverage filters, and retain 10 significant factors for model training. The final stock universe contains 252 stocks. Each monthly cross-section is represented as
+\[
+    X_t \in \mathbb{R}^{252 \times 10}, \qquad r_{t+1}\in \mathbb{R}^{252}.
+\]
+The out-of-sample evaluation uses 10 rolling windows, with a 36-month training window and a 3-month test step.
+
+The contribution of this draft is threefold. First, we summarize the theoretical insight of \citet{wang2026mlmm} in a form suitable for a presentation manuscript. Second, we document our factor construction, IC screening, model architecture, optimization layer, and rolling-window design. Third, we report the warm-start empirical results, especially the comparison between E2E and MSE-based baselines under return-only, return-plus-risk, and return-plus-risk-plus-transaction-cost objectives.
+
+Figure~\ref{fig:conceptual_framework} provides a visual roadmap of the paper. 
+It contrasts the traditional two-stage predict-then-optimize framework with decision-aware learning methods. 
+The figure highlights the central mismatch between statistical prediction accuracy and portfolio utility, and summarizes three related approaches: end-to-end learning, smart predict-then-optimize learning, and parametric portfolio policies. 
+This roadmap also clarifies how our empirical analysis is organized around return, Sharpe ratio, turnover, and investor-specific portfolio frontiers.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{fig1.png}
+    \caption{Conceptual roadmap of decision-aware portfolio learning. 
+    The traditional two-stage framework first predicts returns and then performs portfolio optimization, which may create an objective mismatch because prediction accuracy does not necessarily imply portfolio utility. 
+    Decision-aware approaches instead align model training with downstream portfolio objectives. 
+    End-to-end learning jointly trains the prediction model through a differentiable optimizer; smart predict-then-optimize learning keeps a two-stage structure but replaces MSE with a decision-aware loss; parametric portfolio policy directly maps characteristics to portfolio weights.}
+    \label{fig:conceptual_framework}
+\end{figure}
+
+\section{Theory Insights}
+
+\subsection{Why MSE is not a portfolio objective}
+
+Let $r_{i,t+1}$ denote the next-period excess return of stock $i$ and let $x_{i,t}$ denote its characteristics. A conventional supervised learning model estimates
+\[
+    \widehat r_{i,t+1}=g(x_{i,t};\theta),
+\]
+by solving
+\begin{equation}
+    \min_{\theta}
+    \frac{1}{NT}\sum_{t=1}^{T}\sum_{i=1}^{N}
+    \left(r_{i,t+1}-g(x_{i,t};\theta)\right)^2.
+    \label{eq:mse}
+\end{equation}
+The model in Eq.~\eqref{eq:mse} is trained as if each stock-month prediction error has the same economic value. This is the source of the mismatch. In a downstream optimizer, many assets receive zero weight because of long-only constraints, concentration caps, risk control, or transaction cost penalties. Errors on inactive or nearly inactive assets may have little effect on realized utility, while small errors on active assets may strongly alter the portfolio.
+
+A simple example in \citet{wang2026mlmm} illustrates the point. Consider three pricing rules: an OLS rule $g^O$, a rule $g^L$ tilted toward large-cap value signals, and a rule $g^S$ tilted toward small-cap growth signals. Although $g^O$ has the best global statistical fit, it is not necessarily the best decision rule. For a conservative investor with high risk aversion, $g^L$ delivers the highest realized utility; for a risk-tolerant investor, $g^S$ delivers the highest realized utility. The lesson is that a lower MSE model can be inferior if it puts forecasting accuracy in the wrong part of the asset universe.
+
+\begin{table}[H]
+\centering
+\caption{Illustrative utility example from the original paper}
+\label{tab:theory_example}
+\begin{threeparttable}
+\begin{tabular}{lccc}
+\toprule
+Investor type & OLS $g^O$ & Pro-large-cap $g^L$ & Pro-small-cap $g^S$ \\
+\midrule
+Risk-averse investor, $\eta=10$ & 31.97 & \textbf{32.01} & 31.90 \\
+Risk-tolerant investor, $\eta=1$ & 62.84 & 62.53 & \textbf{62.90} \\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}
+\small
+\item Notes: Values are realized utilities in percent reported in the four-asset example of \citet{wang2026mlmm}. The best statistical predictor is not necessarily the best portfolio input once investor preferences are imposed.
+\end{tablenotes}
+\end{threeparttable}
+\end{table}
+
+\subsection{End-to-end learning as bilevel optimization}
+
+The E2E framework replaces the statistical training objective with a decision-oriented objective. At each date $t$, the prediction model generates a vector of expected returns,
+\[
+    \widehat{\bm r}_{t+1}=g(X_t;\theta).
+\]
+These predictions are then passed into a lower-level portfolio optimizer:
+\begin{equation}
+    \bm w_t^\star(\theta)
+    =
+    \arg\min_{\bm w_t\in\mathcal{W}}
+    f_{\ell}\left(\bm w_t,\widehat{\bm r}_{t+1}\right),
+    \label{eq:lower}
+\end{equation}
+where $\mathcal{W}$ encodes constraints such as long-only positions, full investment, and maximum position size. The upper-level problem chooses $\theta$ by minimizing realized decision loss:
+\begin{equation}
+    \min_\theta \frac{1}{T}\sum_{t=1}^{T}
+    f_u\left(\bm w_t^\star(\theta), \bm r_{t+1}\right).
+    \label{eq:e2e_general}
+\end{equation}
+This is a bilevel problem because the model parameters determine the forecasts, the forecasts determine the optimal portfolio, and the realized portfolio objective determines the gradient used to update the model.
+
+The main technical difficulty is differentiating through the optimizer:
+\[
+    \frac{\partial f_u}{\partial \theta}
+    =
+    \frac{\partial \widehat{\bm r}}{\partial \theta}^{\top}
+    \frac{\partial \bm w^\star}{\partial \widehat{\bm r}}^{\top}
+    \frac{\partial f_u}{\partial \bm w^\star}.
+\]
+The middle term, $\partial \bm w^\star/\partial \widehat{\bm r}$, is computed from the KKT conditions of the constrained optimization problem. This is the mechanism that allows the model to learn which prediction errors matter for the portfolio.
+
+\subsection{From return-only E2E to transaction-cost-aware E2E}
+
+Our warm-start implementation follows three increasingly complete objectives.
+
+\paragraph{Return-only E2E.}
+The first specification uses a smoothed long-only top-decile optimizer:
+\begin{equation}
+    \bm w_t^\star
+    =
+    \arg\min_{\bm w}
+    \left\{
+    -\widehat{\bm r}_{t+1}^{\top}\bm w
+    +\frac{\zeta}{2}\|\bm w\|_2^2
+    \right\},
+    \quad
+    \bm w\ge 0,\quad \bm 1^\top \bm w=1,\quad w_i\le \frac{10}{N}.
+    \label{eq:return_only_inner}
+\end{equation}
+The outer loss is the negative realized portfolio return,
+\[
+    \ell_t^{\mathrm{return}}= -\bm w_t^{\star\top}\bm r_{t+1}.
+\]
+The technical smoothing parameter $\zeta$ is important because a pure linear program produces piecewise-constant weights and sparse gradients. Our implementation uses a larger $\zeta$ during training to increase the number of free variables and a small $\zeta$ during testing to recover the sharper portfolio rule.
+
+\paragraph{Return-plus-risk E2E.}
+The second specification introduces investor risk preference using a diagonal covariance proxy $D_t=\mathrm{diag}(\sigma_{i,t}^2)$:
+\begin{equation}
+    \bm w_t^\star
+    =
+    \arg\min_{\bm w\in\mathcal{W}}
+    \left\{
+    -\widehat{\bm r}_{t+1}^{\top}\bm w
+    +\lambda\sqrt{\bm w^\top D_t\bm w}
+    +\frac{\zeta}{2}\|\bm w\|_2^2
+    \right\}.
+    \label{eq:return_risk_inner}
+\end{equation}
+The corresponding outer loss is
+\[
+    \ell_t^{\mathrm{return+risk}}
+    =
+    -\bm w_t^{\star\top}\bm r_{t+1}
+    +\lambda\sqrt{\bm w_t^{\star\top}D_t\bm w_t^\star}.
+\]
+This aligns the inner optimizer and outer loss around mean--standard-deviation utility. It is closer to the risk-preference section of the original paper, but it still does not internalize turnover costs during training.
+
+\paragraph{Return-plus-risk-plus-transaction-cost E2E.}
+The final warm-start specification aligns with Eq.~(21) of \citet{wang2026mlmm}. It includes return, risk, and transaction costs in both the lower-level optimizer and the upper-level loss:
+\begin{equation}
+\begin{aligned}
+    \min_{\theta}\frac{1}{T}\sum_{t=1}^{T}
+    \bigg[
+    -\bm w_t^{\star\top}\bm r_{t+1}
+    +\frac{\gamma}{2}\|\bm w_t^\star-\bm w_{t-1}^\star\|_1
+    +\lambda\sqrt{\bm w_t^{\star\top}D_t\bm w_t^\star}
+    \bigg]
+\end{aligned}
+\label{eq:return_risk_tc_outer}
+\end{equation}
+subject to
+\begin{equation}
+\begin{aligned}
+    \bm w_t^\star
+    =
+    \arg\min_{\bm w_t\in\mathcal{W}}
+    \bigg\{
+    -\widehat{\bm r}_{t+1}^{\top}\bm w_t
+    +\frac{\gamma}{2}\|\bm w_t-\bm w_{t-1}\|_1
+    +\lambda\sqrt{\bm w_t^\top D_t\bm w_t}
+    +\frac{\zeta}{2}\|\bm w_t\|_2^2
+    \bigg\}.
+\end{aligned}
+\label{eq:return_risk_tc_inner}
+\end{equation}
+The feasible set is
+\[
+    \mathcal{W}
+    =
+    \left\{
+    \bm w\in\mathbb{R}^{N}_{+}:
+    \bm 1^\top\bm w=1,\;
+    w_i\le \frac{10}{N}
+    \right\}.
+\]
+The term $\|\bm w_t-\bm w_{t-1}\|_1$ is two-sided turnover, so the cost is multiplied by $\gamma/2$. In implementation, the absolute value is smoothed as
+\[
+    |x|\approx \sqrt{x^2+\varepsilon_{\mathrm{tc}}},
+\]
+which stabilizes the gradient. This specification is the most faithful to the original paper among our completed warm-start experiments.
+
+\section{Empirical Experiment}
+
+\subsection{Data and factor construction}
+
+The project uses CSI 300 constituent-level monthly factor and return data. The raw daily dataset contains 426,060 stock-day observations, 320 stocks, and 1,393 trading dates from 2020-04-08 to 2025-12-31. We construct 103 raw factors across 10 economic categories, including momentum, volatility, liquidity, behavioral trading factors, technical indicators, value, size, profitability, financial quality, and growth. Daily factors are converted into month-end snapshots and matched with next-month forward returns. After forward-return construction, the preliminary processed panel contains 68 months and 21,760 stock-month rows before the final complete-universe filter. The E2E implementation then uses a balanced stock universe of 252 stocks across the same 68 months, yielding 17,136 stock-month observations in the final model input.
+
+The factor analysis procedure applies monthly Spearman IC tests on preprocessed factors. The preprocessing uses outlier treatment, size neutralization, and cross-sectional standardization. Factors are selected using an absolute IC $t$-statistic threshold and coverage filters. The resulting modeling dataset contains 10 significant factors and a stable universe of 252 stocks.
+
+\begin{table}[t]
+\centering
+\caption{Sample construction and rolling-window design}
+\label{tab:data_summary}
+\begin{tabular}{ll}
+\toprule
+Item & Implementation detail \\
+\midrule
+Raw stock-day observations & 426,060 \\
+Raw stock universe & 320 stocks \\
+Raw date range & 2020-04-08 to 2025-12-31 \\
+Monthly snapshots & 69 month-ends \\
+Valid months with forward returns & 68 months \\
+Processed factor panel before final universe filter & 21,760 stock-month observations \\
+Final E2E stock universe & 252 stocks \\
+Final E2E panel size & 17,136 stock-month observations \\
+Candidate factors & 103 raw factors \\
+Selected factors & 10 significant factors \\
+Feature matrix per month & $X_t\in\mathbb{R}^{252\times 10}$ \\
+Return vector per month & $r_{t+1}\in\mathbb{R}^{252}$ \\
+Training window & 36 months \\
+Test step & 3 months \\
+Number of rolling windows & 10 \\
+Out-of-sample test period & 2023-04 to 2025-09 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Selected factors used in the E2E experiments}
+\label{tab:selected_factors}
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+Factor & Category & Subtype & Economic interpretation \\
+\midrule
+F91\_ocf\_ni & Profitability & Quality & Operating cash flow over net income \\
+F97\_accruals & Financial quality & Quality & Accruals ratio; larger accruals indicate weaker earnings quality \\
+F80\_ocf\_mv & Value & Cash flow & Operating cash flow scaled by market value or price \\
+F74\_cfp & Value & Cash flow & Operating cash flow-to-price or cash-flow yield \\
+F55\_holding\_adj & Behavioral & Holding cost & Market-adjusted holding return \\
+F81\_size & Size & Market capitalization & Log total market capitalization \\
+F34\_vol\_of\_vol & Volatility & Second-order risk & Volatility of volatility \\
+F88\_cash\_roe & Profitability & Cash profitability & Operating cash flow over equity \\
+F41\_turn\_std & Liquidity & Turnover & Cross-time turnover-rate volatility \\
+F30\_range\_vol & Volatility & Range risk & Price-range-based volatility \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Model architecture and training}
+
+All E2E and MSE models use the same shallow cross-sectional MLP:
+\[
+    10 \rightarrow \mathrm{LayerNorm}
+    \rightarrow 32
+    \rightarrow \mathrm{BatchNorm}+\mathrm{ReLU}+\mathrm{Dropout}
+    \rightarrow 16
+    \rightarrow \mathrm{BatchNorm}+\mathrm{ReLU}+\mathrm{Dropout}
+    \rightarrow 1.
+\]
+The model has 1,013 trainable parameters and outputs one scalar predicted return for each stock in each monthly cross-section.
+
+Training uses a warm-start procedure. Each rolling window first trains the MLP for 10 epochs with MSE. The E2E model is then further trained for 60 epochs using the appropriate decision loss. This procedure follows the computational motivation in \citet{wang2026mlmm}: an MSE-trained model is not decision-aligned, but it provides a useful starting point for the more expensive E2E optimization. We also include a small IC auxiliary loss with weight $\alpha_{\mathrm{IC}}=0.05$ so that all stocks receive some cross-sectional directional gradient even when the optimization layer produces sparse active-set gradients.
+
+The MSE baseline is not a naive prediction-only benchmark. In each experiment, the MSE model is trained with the statistical MSE objective, and then its predictions are passed through the same downstream test-time optimizer used by the corresponding E2E specification. For the return-plus-risk-plus-transaction-cost specification, this gives an MSE-Opt benchmark with the same risk-plus-transaction-cost optimizer at test time. This design isolates the benefit of decision-aware training rather than merely comparing different portfolio optimizers.
+
+\begin{table}[H]
+\centering
+\caption{Warm-start objective specifications}
+\label{tab:model_variants}
+\small
+\begin{tabularx}{\textwidth}{p{0.22\textwidth}p{0.22\textwidth}p{0.30\textwidth}p{0.12\textwidth}X}
+\toprule
+Objective specification & Inner optimizer & Outer loss & Cost-aware in training?\\
+\midrule
+Return-only E2E & Smoothed long-only LP & $-\bm w^\top \bm r$ & No\\
+Return-plus-risk E2E & Diagonal mean--SD SOCP & $-\bm w^\top \bm r+\lambda\sqrt{\bm w^\top D\bm w}$ & No  \\
+Return-plus-risk-plus-transaction-cost E2E & Diagonal mean--SD SOCP with smoothed turnover & $-\bm w^\top \bm r+\frac{\gamma}{2}\|\Delta \bm w\|_1+\lambda\sqrt{\bm w^\top D\bm w}$ & Yes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Main performance results}
+
+Table~\ref{tab:main_results} summarizes the main warm-start results. The return-only E2E specification already improves annualized return and Sharpe ratio relative to the MSE baseline. Adding risk awareness reduces volatility and drawdown while preserving a large performance advantage. The return-plus-risk-plus-transaction-cost specification, which includes transaction costs in both training and evaluation, achieves a better balance between return, risk, and turnover.
+
+\begin{table}[t]
+\centering
+\caption{Out-of-sample performance: E2E versus MSE benchmarks}
+\label{tab:main_results}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{llrrrrrrr}
+\toprule
+Specification & Method & Ann. Ret. & Ann. Vol. & Sharpe & Sortino & MDD & Win Rate & Avg. TO \\
+\midrule
+Return-only & E2E & 33.00\% & 29.35\% & 1.124 & 3.209 & -17.32\% & 50.0\% & 120.16\% \\
+Return-only & MSE & 24.92\% & 29.39\% & 0.848 & 2.365 & -22.11\% & 50.0\% & 147.08\% \\
+Return-only & Equal weight & 10.67\% & 20.30\% & 0.525 & 1.471 & -17.30\% & 46.7\% & 0.00\% \\
+\midrule
+Return-plus-risk & E2E & 27.31\% & 24.16\% & 1.131 & 4.620 & -12.24\% & 56.7\% & 113.39\% \\
+Return-plus-risk & MSE & 15.23\% & 23.55\% & 0.646 & 1.797 & -20.46\% & 40.0\% & 138.55\% \\
+Return-plus-risk & Equal weight & 10.67\% & 20.30\% & 0.525 & 1.471 & -17.30\% & 46.7\% & 0.00\% \\
+\midrule
+Return-plus-risk-plus-transaction-cost, $\gamma=0.003$ & E2E & 29.32\% & 24.13\% & 1.215 & 4.750 & -11.32\% & 56.7\% & 112.03\% \\
+Return-plus-risk-plus-transaction-cost, $\gamma=0.003$ & MSE-Opt & 18.03\% & 23.45\% & 0.769 & 2.145 & -18.81\% & 46.7\% & 132.71\% \\
+Return-plus-risk-plus-transaction-cost, $\gamma=0.003$ & Equal weight & 10.67\% & 20.30\% & 0.525 & 1.424 & -17.30\% & 46.7\% & 0.00\% \\
+\bottomrule
+\end{tabular}}
+\begin{flushleft}
+\small
+Notes: All returns and volatilities are annualized from monthly out-of-sample returns. Avg. TO is average two-sided turnover. The return-only and return-plus-risk specifications deduct transaction costs in evaluation under their implementation settings but do not train with a transaction-cost-aware objective. The return-plus-risk-plus-transaction-cost specification uses the Eq.~(21)-style convention $\frac{\gamma}{2}\|\Delta \bm w\|_1$ consistently in the optimizer, outer loss, and realized net-return calculation.
+\end{flushleft}
+\end{table}
+
+Table~\ref{tab:deltas} reports the direct E2E improvements over the corresponding MSE benchmark. The most important finding is that the advantage is not limited to the return-only objective. Once risk and transaction costs are added, E2E still improves both return and Sharpe ratio, while also lowering turnover.
+
+\begin{table}[H]
+\centering
+\caption{E2E improvement over MSE benchmarks}
+\label{tab:deltas}
+\begin{tabular}{lrrr}
+\toprule
+Specification & $\Delta$ Ann. Ret. & $\Delta$ Sharpe & $\Delta$ Avg. TO \\
+\midrule
+Return-only & +8.08 pp & +0.277 & -26.92 pp \\
+Return-plus-risk & +12.09 pp & +0.484 & -25.16 pp \\
+Return-plus-risk-plus-transaction-cost, $\gamma=0.003$ & +11.29 pp & +0.446 & -20.69 pp \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\small
+Notes: Improvements are computed relative to the corresponding MSE or MSE-Opt benchmark within the same portfolio objective. Avg. TO denotes average two-sided turnover.
+\end{flushleft}
+\end{table}
+
+\subsection{Transaction-cost sensitivity}
+
+The return-plus-risk-plus-transaction-cost experiment is repeated under three transaction cost parameters: $\gamma=0.001$, $\gamma=0.002$, and $\gamma=0.003$, with $\lambda=1.0$ fixed. The result is stable across all three settings. E2E improves annualized return by approximately 11.3 percentage points and Sharpe ratio by approximately 0.45 in every case. It also reduces turnover by 20--24 percentage points relative to MSE-Opt. This is consistent with the original paper's mechanism: MSE-Opt can apply cost-aware optimization after prediction, but only E2E trains the signal itself to be cost-aware.
+
+\begin{table}[H]
+\centering
+\caption{Transaction-cost sensitivity, $\lambda=1.0$}
+\label{tab:gamma_results}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{llrrrrrrrr}
+\toprule
+$\gamma$ & Method & Ann. Ret. & Ann. Vol. & Sharpe & Sortino & MDD & Win Rate & Avg. TO & E2E--MSE Sharpe Gap \\
+\midrule
+0.001 & E2E & 30.73\% & 24.11\% & 1.274 & 4.958 & -10.76\% & 56.7\% & 112.86\% & \multirow{2}{*}{+0.447} \\
+0.001 & MSE-Opt & 19.47\% & 23.54\% & 0.827 & 2.240 & -18.58\% & 50.0\% & 136.54\% & \\
+\midrule
+0.002 & E2E & 30.04\% & 24.14\% & 1.245 & 4.860 & -11.01\% & 56.7\% & 112.45\% & \multirow{2}{*}{+0.447} \\
+0.002 & MSE-Opt & 18.74\% & 23.50\% & 0.797 & 2.193 & -18.70\% & 46.7\% & 134.61\% & \\
+\midrule
+0.003 & E2E & 29.32\% & 24.13\% & 1.215 & 4.750 & -11.32\% & 56.7\% & 112.03\% & \multirow{2}{*}{+0.446} \\
+0.003 & MSE-Opt & 18.03\% & 23.45\% & 0.769 & 2.145 & -18.81\% & 46.7\% & 132.71\% & \\
+\bottomrule
+\end{tabular}}
+\begin{flushleft}
+\small
+Notes: Transaction cost is evaluated as $\frac{\gamma}{2}\|\bm w_t-\bm w_{t-1}\|_1$. The E2E--MSE annualized return gaps are +11.26, +11.31, and +11.29 percentage points for $\gamma=0.001,0.002,0.003$, respectively. The corresponding turnover reductions are -23.68, -22.16, and -20.69 percentage points.
+\end{flushleft}
+\end{table}
+
+\subsection{Risk-aversion sensitivity}
+
+The transaction-cost-aware experiments also conduct a full sensitivity sweep over the risk-aversion parameter $\lambda$. This exercise is important because the original paper emphasizes that E2E learning generates investor-specific portfolio rules: changing risk preference changes not only the downstream optimizer but also the prediction model learned through the optimizer. Table~\ref{tab:lambda_sensitivity} reports the full E2E performance summary for $\lambda\in\{0.1,0.5,1.0,2.0,5.0,10.0\}$ under each transaction-cost level.
+
+The pattern is economically coherent. Low risk aversion, especially $\lambda=0.1$ and $\lambda=0.5$, produces the highest annualized returns, but these portfolios also carry higher annualized volatility and deeper drawdowns. Intermediate risk aversion, particularly $\lambda=1.0$ and $\lambda=2.0$, delivers the strongest Sharpe ratios across transaction-cost settings. High risk aversion, $\lambda=5.0$ and $\lambda=10.0$, substantially lowers volatility, maximum drawdown, and turnover, but the reduction in expected return is large enough to reduce Sharpe performance. Thus, the sensitivity results are not merely robustness checks; they empirically illustrate the investor-specific frontier emphasized by \citet{wang2026mlmm}.
+
+\begin{table}[H]
+\centering
+\caption{Risk-aversion sensitivity across transaction-cost levels}
+\label{tab:lambda_sensitivity}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ccrrrrrr}
+\toprule
+$\gamma$ & $\lambda$ & Ann. Ret. & Ann. Vol. & Sharpe & Sortino & MDD & Avg. TO \\
+\midrule
+0.001 & 0.1  & 34.34\% & 28.33\% & 1.212 & 3.440 & -13.98\% & 119.20\% \\
+0.001 & 0.5  & 32.38\% & 26.47\% & 1.223 & 3.845 & -11.20\% & 118.00\% \\
+0.001 & 1.0  & 30.73\% & 24.11\% & 1.274 & 4.958 & -10.76\% & 112.86\% \\
+0.001 & 2.0  & 23.15\% & 18.16\% & \textbf{1.275} & 3.719 & -8.29\% & 108.00\% \\
+0.001 & 5.0  & 13.17\% & 15.81\% & 0.833 & 2.556 & -6.06\% & 93.46\% \\
+0.001 & 10.0 & 12.77\% & 15.24\% & 0.838 & 2.395 & -6.61\% & 67.72\% \\
+\midrule
+0.002 & 0.1  & 33.93\% & 28.28\% & 1.200 & 3.406 & -14.01\% & 118.71\% \\
+0.002 & 0.5  & 31.61\% & 26.50\% & 1.193 & 3.769 & -11.43\% & 117.65\% \\
+0.002 & 1.0  & 30.04\% & 24.14\% & \textbf{1.245} & 4.860 & -11.01\% & 112.45\% \\
+0.002 & 2.0  & 22.45\% & 18.16\% & 1.236 & 3.581 & -8.58\% & 107.58\% \\
+0.002 & 5.0  & 12.63\% & 15.82\% & 0.799 & 2.438 & -6.29\% & 92.94\% \\
+0.002 & 10.0 & 12.38\% & 15.24\% & 0.812 & 2.319 & -6.76\% & 67.35\% \\
+\midrule
+0.003 & 0.1  & 33.08\% & 28.28\% & 1.170 & 3.315 & -14.39\% & 118.42\% \\
+0.003 & 0.5  & 30.99\% & 26.51\% & 1.169 & 3.601 & -11.62\% & 117.19\% \\
+0.003 & 1.0  & 29.32\% & 24.13\% & \textbf{1.215} & 4.750 & -11.32\% & 112.03\% \\
+0.003 & 2.0  & 21.67\% & 18.17\% & 1.193 & 3.451 & -8.90\% & 107.09\% \\
+0.003 & 5.0  & 12.11\% & 15.83\% & 0.765 & 2.322 & -6.52\% & 92.39\% \\
+0.003 & 10.0 & 11.98\% & 15.25\% & 0.786 & 2.239 & -6.92\% & 67.01\% \\
+\bottomrule
+\end{tabular}}
+\begin{flushleft}
+\small
+Notes: Results are from the E2E return-plus-risk-plus-transaction-cost specification. The table reports annualized return, annualized volatility, Sharpe ratio, Sortino ratio, maximum drawdown, and average two-sided turnover. Win rates are 56.7\%, 60.0\%, 56.7\%, 63.3\%, 60.0\%, and 56.7\% for $\lambda=0.1,0.5,1.0,2.0,5.0,10.0$ when $\gamma=0.001$; 56.7\%, 60.0\%, 56.7\%, 63.3\%, 60.0\%, and 56.7\% when $\gamma=0.002$; and 53.3\%, 56.7\%, 56.7\%, 63.3\%, 60.0\%, and 56.7\% when $\gamma=0.003$. Bold Sharpe ratios mark the best value within each transaction-cost level.
+\end{flushleft}
+\end{table}
+
+Table~\ref{tab:lambda_best} gives a more compact view of the same sensitivity exercise. The return-maximizing specification is always $\lambda=0.1$, while the Sharpe-maximizing specification shifts between $\lambda=2.0$ and $\lambda=1.0$ depending on transaction cost. This is exactly what one should expect from a decision-aligned Markowitz model: the optimal forecasting rule is conditional on both the investor's risk preference and the implementation friction.
+
+\begin{table}[H]
+\centering
+\caption{Best-performing $\lambda$ choices in risk-aversion sensitivity tests}
+\label{tab:lambda_best}
+\begin{tabular}{ccccc}
+\toprule
+$\gamma$ & Return-maximizing $\lambda$ & Ann. Ret. & Sharpe-maximizing $\lambda$ & Sharpe \\
+\midrule
+0.001 & 0.1 & 34.34\% & 2.0 & 1.275 \\
+0.002 & 0.1 & 33.93\% & 1.0 & 1.245 \\
+0.003 & 0.1 & 33.08\% & 1.0 & 1.215 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Interpretation}
+
+The empirical pattern is aligned with the theory. The MSE model is trained to improve average prediction accuracy, while the E2E model is trained to improve portfolio utility. When the final decision problem includes a long-only constraint and a maximum holding constraint, the E2E model learns to put its predictive capacity where it matters for the constrained portfolio. When risk aversion is added, the E2E model shifts from pure return chasing toward mean--SD utility. When transaction costs are added, the E2E model trades off predicted return against turnover inside the optimizer, and its prediction parameters are trained under this same cost-aware objective.
+
+This distinction explains why MSE-Opt remains inferior to E2E. MSE-Opt uses the same downstream optimizer as the return-plus-risk-plus-transaction-cost specification, so it is not disadvantaged at the portfolio construction stage. Its weakness is upstream: the prediction model is still trained without seeing the risk and cost terms. The E2E model receives gradient feedback through the optimizer, so its parameters are updated according to realized utility rather than average forecast error.
+
+There are also implementation caveats. First, the sample is short and monthly, so statistical inference should be treated cautiously. Second, we use a diagonal covariance proxy for computational stability. Third, the transaction cost term is smoothed for differentiability. Fourth, the current work is a methodology replication rather than a comprehensive empirical replication of the original daily A-share study. These limitations do not invalidate the exercise; they define the scope of the claim. The claim is not that we reproduce every empirical magnitude in \citet{wang2026mlmm}, but that the E2E mechanism is implementable and economically meaningful in a CSI 300 monthly setting.
+
+\section{Conclusion}
+
+This project replicates the core methodological insight of \citet{wang2026mlmm}: portfolio prediction should be trained for the portfolio decision, not for an isolated statistical criterion. In our CSI 300 implementation, the E2E warm-start pipeline consistently outperforms MSE-based benchmarks. The return-only E2E model improves annualized return and Sharpe ratio. The return-plus-risk E2E specification further aligns training with mean--standard-deviation utility. The return-plus-risk-plus-transaction-cost specification, aligned with Eq.~(21), incorporates return, risk, and transaction costs in both the inner optimizer and outer loss. Under $\lambda=1.0$ and $\gamma=0.003$, the return-plus-risk-plus-transaction-cost specification improves annualized return by 11.29 percentage points, improves Sharpe ratio by 0.446, and reduces two-sided turnover by 20.69 percentage points relative to MSE-Opt. The additional $\lambda$-sensitivity analysis further shows that E2E produces an economically interpretable risk-return frontier: low $\lambda$ maximizes raw return, intermediate $\lambda$ maximizes Sharpe ratio, and high $\lambda$ lowers volatility, drawdown, and turnover.
+
+The broader implication is that the efficient frontier faced by an investor is not merely a market object. Once expected returns are produced by a machine learning model and the portfolio is constrained by long-only rules, concentration caps, risk preferences, and market frictions, the realized frontier becomes investor-specific and model-specific. E2E learning offers a practical way to internalize these features during training. For the final presentation, the strongest narrative is therefore: Markowitz tells us how to optimize given expectations; \emph{Machine Learning Meets Markowitz} asks how expectations should be learned when the final object is an implementable portfolio.
+
+\begin{thebibliography}{99}
+
+\bibitem[Agrawal et~al.(2019)]{agrawal2019cvxpylayers}
+Agrawal, A., Amos, B., Barratt, S., Boyd, S., Diamond, S., and Kolter, J.~Z. (2019).
+Differentiable convex optimization layers.
+\emph{Advances in Neural Information Processing Systems}, 32.
+
+\bibitem[Amos and Kolter(2017)]{amos2017optnet}
+Amos, B. and Kolter, J.~Z. (2017).
+OptNet: Differentiable optimization as a layer in neural networks.
+\emph{Proceedings of the 34th International Conference on Machine Learning}.
+
+\bibitem[Boyd and Vandenberghe(2004)]{boyd2004convex}
+Boyd, S. and Vandenberghe, L. (2004).
+\emph{Convex Optimization}.
+Cambridge University Press.
+
+\bibitem[Brandt et~al.(2009)]{brandt2009parametric}
+Brandt, M.~W., Santa-Clara, P., and Valkanov, R. (2009).
+Parametric portfolio policies: Exploiting characteristics in the cross-section of equity returns.
+\emph{Review of Financial Studies}, 22(9), 3411--3447.
+
+\bibitem[Gu et~al.(2020)]{gu2020empirical}
+Gu, S., Kelly, B., and Xiu, D. (2020).
+Empirical asset pricing via machine learning.
+\emph{Review of Financial Studies}, 33(5), 2223--2273.
+
+\bibitem[Markowitz(1952)]{markowitz1952portfolio}
+Markowitz, H. (1952).
+Portfolio selection.
+\emph{Journal of Finance}, 7(1), 77--91.
+
+\bibitem[Wang et~al.(2026)]{wang2026mlmm}
+Wang, Y., Gao, H., Harvey, C.~R., Liu, Y., and Tao, X. (2026).
+Machine Learning Meets Markowitz.
+Current draft, February 10, 2026.
+
+
+
+% ==================== Appendix ====================
+% Insert the following appendix after the conclusion and before the bibliography.
+
+\clearpage
+\appendix
+\section{Core Implementation Code}
+
+This appendix reports the core implementation logic for the three end-to-end portfolio-learning objectives. 
+Data loading, factor preprocessing, notebook outputs, diagnostic plots, and auxiliary reporting code are omitted for compactness. 
+The three specifications correspond to the return-only objective, the return-plus-risk objective, and the return-plus-risk-plus-transaction-cost objective.
+
+\subsection{Shared Prediction Model and Auxiliary Loss}
+
+\begin{lstlisting}[style=appendixpython,caption={Shared neural prediction model and auxiliary loss}]
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.optimize import minimize
+
+torch.set_default_dtype(torch.float64)
+
+# Common hyperparameters
+HIDDEN_DIM = 32
+CAP_MULT = 10.0
+ALPHA_IC = 0.05
+BATCH_SIZE = 8
+GRAD_CLIP = 1.0
+LR_MSE = 1e-3
+LR_E2E = 1e-4
+N_WARM = 10
+N_E2E = 60
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class CrossSectionalMLP(nn.Module):
+    """
+    Cross-sectional return predictor.
+
+    Input:
+        x_t: firm characteristics for one monthly cross-section, shape [N, K]
+
+    Output:
+        predicted returns for N stocks, shape [N]
+    """
+    def __init__(self, input_dim, hidden_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def ic_aux_loss(mu, r):
+    """
+    Cross-sectional directional auxiliary loss.
+
+    This term gives all stocks a smooth directional gradient even when the
+    downstream portfolio optimizer produces sparse active-set gradients.
+    """
+    mu_z = (mu - mu.mean()) / (mu.std(unbiased=False) + 1e-12)
+    r_z = (r - r.mean()) / (r.std(unbiased=False) + 1e-12)
+    return -(mu_z * r_z).mean()
+
+
+def capped_softmax_weights(mu, cap_mult=CAP_MULT, temperature=0.10):
+    """
+    Differentiable portfolio-weight surrogate used during E2E training.
+
+    The exact test-time optimizer is solved separately. During training,
+    a capped softmax provides stable gradients through the portfolio layer.
+    """
+    n = mu.shape[0]
+    cap = cap_mult / n
+
+    w = torch.softmax(mu / temperature, dim=0)
+    w = torch.clamp(w, max=cap)
+    w = w / (w.sum() + 1e-12)
+
+    return w
+\end{lstlisting}
+
+\subsection{Return-only Objective}
+
+\begin{lstlisting}[style=appendixpython,caption={Core implementation of the return-only objective}]
+def return_only_e2e_loss(model, x_t, r_t):
+    """
+    E2E objective:
+        min_theta  - w(mu_theta)' r
+
+    The model is trained to maximize realized portfolio return directly,
+    rather than minimizing prediction error.
+    """
+    mu = model(x_t)
+    w = capped_softmax_weights(mu)
+
+    portfolio_return = torch.dot(w, r_t)
+    loss = -portfolio_return + ALPHA_IC * ic_aux_loss(mu, r_t)
+
+    return loss
+
+
+def solve_return_only_portfolio(mu, cap_mult=CAP_MULT, zeta=1e-5):
+    """
+    Test-time optimizer for the return-only specification:
+
+        min_w  - mu' w + zeta / 2 * ||w||_2^2
+        s.t.   1'w = 1, 0 <= w_i <= cap
+
+    The small quadratic term smooths the otherwise piecewise-linear
+    portfolio rule and stabilizes the active set.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    n = len(mu)
+    cap = cap_mult / n
+
+    # Projection form: solve for tau such that sum clip(mu/zeta - tau, 0, cap)=1.
+    y = mu / zeta
+    lo = y.max() - cap - 1.0
+    hi = y.max() + 1.0
+
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        w = np.clip(y - mid, 0.0, cap)
+        if w.sum() > 1.0:
+            lo = mid
+        else:
+            hi = mid
+
+    tau = 0.5 * (lo + hi)
+    w = np.clip(y - tau, 0.0, cap)
+    w = w / w.sum()
+
+    return w
+
+
+def evaluate_return_only_step(model, x_t, r_t, w_prev, gamma=0.003):
+    """
+    One-period out-of-sample evaluation.
+
+    Transaction cost is deducted in realized net return for comparability,
+    although the return-only training objective is not cost-aware.
+    """
+    with torch.no_grad():
+        mu = model(torch.tensor(x_t, device=DEVICE)).cpu().numpy()
+
+    w = solve_return_only_portfolio(mu)
+    gross_return = float(np.dot(w, r_t))
+    turnover = float(np.abs(w - w_prev).sum())
+    transaction_cost = 0.5 * gamma * turnover
+    net_return = gross_return - transaction_cost
+
+    return w, net_return, turnover
+\end{lstlisting}
+
+\subsection{Return-plus-risk Objective}
+
+\begin{lstlisting}[style=appendixpython,caption={Core implementation of the return-plus-risk objective}]
+def return_risk_e2e_loss(model, x_t, r_t, sig2_t, lambda_risk=1.0):
+    """
+    E2E objective:
+        min_theta  - w(mu_theta)' r
+                   + lambda * sqrt(w' D w)
+
+    D is a diagonal covariance proxy estimated from trailing stock returns.
+    """
+    mu = model(x_t)
+    w = capped_softmax_weights(mu)
+
+    portfolio_return = torch.dot(w, r_t)
+    portfolio_risk = torch.sqrt(torch.sum(sig2_t * w * w) + 1e-12)
+
+    loss = (
+        -portfolio_return
+        + lambda_risk * portfolio_risk
+        + ALPHA_IC * ic_aux_loss(mu, r_t)
+    )
+
+    return loss
+
+
+def solve_return_risk_portfolio(mu, sig2, lambda_risk=1.0,
+                                cap_mult=CAP_MULT, zeta=1e-5):
+    """
+    Test-time optimizer for the return-plus-risk specification:
+
+        min_w  - mu' w + lambda * sqrt(w' D w)
+               + zeta / 2 * ||w||_2^2
+        s.t.   1'w = 1, 0 <= w_i <= cap
+
+    The diagonal matrix D is represented by its diagonal vector sig2.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sig2 = np.asarray(sig2, dtype=np.float64)
+
+    n = len(mu)
+    cap = cap_mult / n
+
+    def obj(w):
+        risk = np.sqrt(np.dot(sig2, w * w) + 1e-12)
+        ridge = 0.5 * zeta * np.dot(w, w)
+        return -np.dot(mu, w) + lambda_risk * risk + ridge
+
+    def grad(w):
+        risk = np.sqrt(np.dot(sig2, w * w) + 1e-12)
+        grad_risk = lambda_risk * (sig2 * w) / risk
+        grad_ridge = zeta * w
+        return -mu + grad_risk + grad_ridge
+
+    constraints = [{
+        "type": "eq",
+        "fun": lambda w: np.sum(w) - 1.0,
+        "jac": lambda w: np.ones_like(w)
+    }]
+
+    bounds = [(0.0, cap)] * n
+    x0 = np.ones(n) / n
+
+    result = minimize(
+        obj,
+        x0,
+        jac=grad,
+        bounds=bounds,
+        constraints=constraints,
+        method="SLSQP",
+        options={"ftol": 1e-10, "maxiter": 300, "disp": False}
+    )
+
+    if not result.success:
+        # Numerical fallback based on risk-adjusted scores.
+        score = mu / (np.sqrt(sig2) + 1e-12)
+        w = np.exp((score - score.max()) / 0.10)
+        w = w / w.sum()
+        w = np.clip(w, 0.0, cap)
+        w = w / w.sum()
+        return w
+
+    return result.x
+
+
+def evaluate_return_risk_step(model, x_t, r_t, sig2_t, w_prev,
+                              lambda_risk=1.0, gamma=0.003):
+    """
+    One-period out-of-sample evaluation under the return-plus-risk optimizer.
+    """
+    with torch.no_grad():
+        mu = model(torch.tensor(x_t, device=DEVICE)).cpu().numpy()
+
+    w = solve_return_risk_portfolio(mu, sig2_t, lambda_risk=lambda_risk)
+
+    gross_return = float(np.dot(w, r_t))
+    portfolio_risk = float(np.sqrt(np.dot(sig2_t, w * w)))
+    turnover = float(np.abs(w - w_prev).sum())
+    transaction_cost = 0.5 * gamma * turnover
+    net_return = gross_return - transaction_cost
+
+    return w, net_return, portfolio_risk, turnover
+\end{lstlisting}
+
+\subsection{Return-plus-risk-plus-transaction-cost Objective}
+
+\begin{lstlisting}[style=appendixpython,caption={Core implementation of the return-plus-risk-plus-transaction-cost objective}]
+def return_risk_tc_e2e_loss(model, x_t, r_t, sig2_t, w_prev,
+                            lambda_risk=1.0, gamma=0.003, eps_tc=1e-6):
+    """
+    E2E objective:
+        min_theta  - w(mu_theta)' r
+                   + lambda * sqrt(w' D w)
+                   + gamma / 2 * ||w - w_prev||_1
+
+    The absolute value in the transaction-cost term is smoothed during
+    training to obtain stable gradients.
+    """
+    mu = model(x_t)
+    w = capped_softmax_weights(mu)
+
+    portfolio_return = torch.dot(w, r_t)
+    portfolio_risk = torch.sqrt(torch.sum(sig2_t * w * w) + 1e-12)
+    transaction_cost = 0.5 * gamma * torch.sqrt((w - w_prev) ** 2 + eps_tc).sum()
+
+    loss = (
+        -portfolio_return
+        + lambda_risk * portfolio_risk
+        + transaction_cost
+        + ALPHA_IC * ic_aux_loss(mu, r_t)
+    )
+
+    return loss, w.detach()
+
+
+def solve_return_risk_tc_portfolio(mu, sig2, w_prev,
+                                   lambda_risk=1.0,
+                                   gamma=0.003,
+                                   cap_mult=CAP_MULT,
+                                   zeta=1e-5,
+                                   eps_tc=1e-6):
+    """
+    Test-time optimizer aligned with the return-risk-transaction-cost objective:
+
+        min_w  - mu' w
+               + lambda * sqrt(w' D w)
+               + gamma / 2 * ||w - w_prev||_1
+               + zeta / 2 * ||w||_2^2
+
+        s.t.   1'w = 1, 0 <= w_i <= cap
+
+    The transaction-cost term penalizes two-sided turnover.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sig2 = np.asarray(sig2, dtype=np.float64)
+    w_prev = np.asarray(w_prev, dtype=np.float64)
+
+    n = len(mu)
+    cap = cap_mult / n
+
+    def obj(w):
+        risk = np.sqrt(np.dot(sig2, w * w) + 1e-12)
+        tc = 0.5 * gamma * np.sqrt((w - w_prev) ** 2 + eps_tc).sum()
+        ridge = 0.5 * zeta * np.dot(w, w)
+        return -np.dot(mu, w) + lambda_risk * risk + tc + ridge
+
+    def grad(w):
+        risk = np.sqrt(np.dot(sig2, w * w) + 1e-12)
+        grad_risk = lambda_risk * (sig2 * w) / risk
+        grad_tc = 0.5 * gamma * (w - w_prev) / np.sqrt((w - w_prev) ** 2 + eps_tc)
+        grad_ridge = zeta * w
+        return -mu + grad_risk + grad_tc + grad_ridge
+
+    constraints = [{
+        "type": "eq",
+        "fun": lambda w: np.sum(w) - 1.0,
+        "jac": lambda w: np.ones_like(w)
+    }]
+
+    bounds = [(0.0, cap)] * n
+
+    # Use the previous portfolio as the numerical starting point.
+    x0 = np.clip(w_prev, 0.0, cap)
+    if x0.sum() <= 1e-12:
+        x0 = np.ones(n) / n
+    else:
+        x0 = x0 / x0.sum()
+
+    result = minimize(
+        obj,
+        x0,
+        jac=grad,
+        bounds=bounds,
+        constraints=constraints,
+        method="SLSQP",
+        options={"ftol": 1e-10, "maxiter": 500, "disp": False}
+    )
+
+    if not result.success:
+        # Numerical fallback based on risk-adjusted scores.
+        score = mu / (np.sqrt(sig2) + 1e-12)
+        w = np.exp((score - score.max()) / 0.10)
+        w = w / w.sum()
+        w = np.clip(w, 0.0, cap)
+        w = w / w.sum()
+        return w
+
+    return result.x
+
+
+def evaluate_return_risk_tc_step(model, x_t, r_t, sig2_t, w_prev,
+                                 lambda_risk=1.0, gamma=0.003):
+    """
+    One-period out-of-sample evaluation under the transaction-cost-aware
+    portfolio optimizer.
+    """
+    with torch.no_grad():
+        mu = model(torch.tensor(x_t, device=DEVICE)).cpu().numpy()
+
+    w = solve_return_risk_tc_portfolio(
+        mu,
+        sig2_t,
+        w_prev,
+        lambda_risk=lambda_risk,
+        gamma=gamma
+    )
+
+    gross_return = float(np.dot(w, r_t))
+    portfolio_risk = float(np.sqrt(np.dot(sig2_t, w * w)))
+    turnover = float(np.abs(w - w_prev).sum())
+    transaction_cost = 0.5 * gamma * turnover
+    net_return = gross_return - transaction_cost
+
+    return w, net_return, portfolio_risk, transaction_cost, turnover
+\end{lstlisting}
+
+\subsection{Warm-start Training Procedure}
+
+\begin{lstlisting}[style=appendixpython,caption={Warm-start training and E2E fine-tuning procedure}]
+def train_mse_warm_start(model, X_train, R_train):
+    """
+    First-stage warm start.
+
+    The predictor is initially trained by MSE. This gives the E2E stage a
+    stable initialization before optimizing the downstream portfolio objective.
+    """
+    optimizer = optim.Adam(model.parameters(), lr=LR_MSE)
+
+    X_train = torch.tensor(X_train, device=DEVICE)
+    R_train = torch.tensor(R_train, device=DEVICE)
+
+    for _ in range(N_WARM):
+        permutation = torch.randperm(X_train.shape[0])
+
+        for start in range(0, X_train.shape[0], BATCH_SIZE):
+            batch_index = permutation[start:start + BATCH_SIZE]
+            loss = 0.0
+
+            for t in batch_index:
+                prediction = model(X_train[t])
+                loss = loss + ((prediction - R_train[t]) ** 2).mean()
+
+            loss = loss / len(batch_index)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+
+    return model
+
+
+def train_e2e(model, X_train, R_train, D_train=None, objective="return-risk-tc",
+              lambda_risk=1.0, gamma=0.003):
+    """
+    Second-stage E2E fine-tuning.
+
+    objective can be:
+        "return-only"
+        "return-risk"
+        "return-risk-tc"
+    """
+    optimizer = optim.Adam(model.parameters(), lr=LR_E2E)
+
+    X_train = torch.tensor(X_train, device=DEVICE)
+    R_train = torch.tensor(R_train, device=DEVICE)
+
+    if D_train is not None:
+        D_train = torch.tensor(D_train, device=DEVICE)
+
+    n_assets = X_train.shape[1]
+    w_prev = torch.ones(n_assets, device=DEVICE) / n_assets
+
+    for _ in range(N_E2E):
+        permutation = torch.randperm(X_train.shape[0])
+
+        for start in range(0, X_train.shape[0], BATCH_SIZE):
+            batch_index = permutation[start:start + BATCH_SIZE]
+            loss = 0.0
+
+            for t in batch_index:
+                x_t = X_train[t]
+                r_t = R_train[t]
+
+                if objective == "return-only":
+                    loss_t = return_only_e2e_loss(model, x_t, r_t)
+
+                elif objective == "return-risk":
+                    sig2_t = D_train[t]
+                    loss_t = return_risk_e2e_loss(
+                        model,
+                        x_t,
+                        r_t,
+                        sig2_t,
+                        lambda_risk=lambda_risk
+                    )
+
+                elif objective == "return-risk-tc":
+                    sig2_t = D_train[t]
+                    loss_t, w_prev = return_risk_tc_e2e_loss(
+                        model,
+                        x_t,
+                        r_t,
+                        sig2_t,
+                        w_prev,
+                        lambda_risk=lambda_risk,
+                        gamma=gamma
+                    )
+
+                else:
+                    raise ValueError("Unknown objective.")
+
+                loss = loss + loss_t
+
+            loss = loss / len(batch_index)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+
+    return model
+\end{lstlisting}
+
+\subsection{Out-of-sample Performance Evaluation}
+
+\begin{lstlisting}[style=appendixpython,caption={Performance evaluation metrics}]
+def performance_summary(monthly_returns, turnovers=None):
+    """
+    Compute standard out-of-sample portfolio performance metrics.
+    """
+    r = np.asarray(monthly_returns)
+
+    annualized_return = (1.0 + r).prod() ** (12.0 / len(r)) - 1.0
+    annualized_volatility = r.std(ddof=1) * np.sqrt(12.0)
+    sharpe_ratio = annualized_return / (annualized_volatility + 1e-12)
+
+    downside_returns = r[r < 0.0]
+    if len(downside_returns) > 1:
+        sortino_ratio = annualized_return / (
+            downside_returns.std(ddof=1) * np.sqrt(12.0) + 1e-12
+        )
+    else:
+        sortino_ratio = np.nan
+
+    cumulative_wealth = np.cumprod(1.0 + r)
+    running_peak = np.maximum.accumulate(cumulative_wealth)
+    maximum_drawdown = ((cumulative_wealth - running_peak) / running_peak).min()
+
+    win_rate = (r > 0.0).mean()
+
+    output = {
+        "Annualized Return": annualized_return,
+        "Annualized Volatility": annualized_volatility,
+        "Sharpe Ratio": sharpe_ratio,
+        "Sortino Ratio": sortino_ratio,
+        "Maximum Drawdown": maximum_drawdown,
+        "Win Rate": win_rate
+    }
+
+    if turnovers is not None:
+        output["Average Turnover"] = np.mean(turnovers)
+
+    return output
+\end{lstlisting}
+
+\end{thebibliography}
+
+\end{document}
